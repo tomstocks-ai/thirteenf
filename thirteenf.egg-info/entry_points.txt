@@ -1,0 +1,2 @@
+[console_scripts]
+thirteenf = thirteenf.cli:main

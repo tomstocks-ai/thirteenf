@@ -1,0 +1,41 @@
+# thirteenf-cli
+
+CLI for 13F holdings data, wrapping the 13f.info JSON data API and the SEC
+EDGAR submissions API. No 13F XML parsing.
+
+## Install
+
+```bash
+pip install -e .
+```
+
+## Usage
+
+```bash
+thirteenf institutions                                  # built-in watchlist (no network)
+thirteenf search morgan                                 # find managers / CUSIPs
+thirteenf holdings 000089542126000243 --limit 20        # aggregated holdings of one filing
+thirteenf compare 000093583626000418 000204572426000008 # quarter-over-quarter changes
+thirteenf holders 037833100 --year 2026 --quarter 2     # who holds Apple
+thirteenf history 0001067983 037833100                  # Berkshire's Apple position over time
+thirteenf filings 0000895421                            # Morgan Stanley's recent 13F filings
+```
+
+- `external_id` = SEC accession number with dashes removed (the `filings`
+  command prints it, ready to pipe into `holdings` / `compare`).
+- Every command accepts `--json` (raw JSON output) and network commands accept
+  `--no-cache` (bypass cache reads; still writes to cache).
+- Values are in $thousands, per 13F convention.
+
+## HTTP behavior
+
+- User-Agent: `thirteenf-cli/0.1 (research tool; contact: user@example.com)`
+  (required by SEC, also sent to 13f.info).
+- Min 1.0s between requests to the same host; 30s timeout; 2 retries on 5xx.
+- File cache in `~/.cache/thirteenf/` (sha256 of URL); TTL 24h for 13f.info,
+  1h for EDGAR submissions.
+
+## TODO (v1)
+
+- OpenFIGI CUSIP→ticker enrichment.
+- Cohort/consensus aggregation across managers.
