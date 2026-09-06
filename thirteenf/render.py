@@ -13,8 +13,13 @@ err_console = Console(stderr=True)
 
 
 def print_json(data: Any) -> None:
-    """Print raw JSON (--json passthrough)."""
-    console.print(json.dumps(data, indent=2, default=str))
+    """Print raw JSON (--json passthrough). No wrapping/markup, stays valid JSON."""
+    console.print(
+        json.dumps(data, indent=2, default=str),
+        markup=False,
+        highlight=False,
+        soft_wrap=True,
+    )
 
 
 def fmt_int(value: Any) -> str:
@@ -37,6 +42,16 @@ def fmt_pct(value: Any) -> str:
 
 def fmt_usd_thousands(value: Any) -> str:
     """13F values are reported in $thousands; render as $ with separators."""
+    if value is None:
+        return "-"
+    try:
+        return f"${int(value):,}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def fmt_usd(value: Any) -> str:
+    """Full-dollar amount (e.g. market cap) with separators."""
     if value is None:
         return "-"
     try:
