@@ -88,16 +88,51 @@ def _resolve_symbol(cusip: str, issuer: str | None = None, *, no_cache: bool = F
     return None
 
 
+def categories() -> list[str]:
+    """All watchlist categories, sorted."""
+    return sorted({i["category"] for i in WATCHLIST})
+
+
 @app.command
-def institutions(json: JsonFlag = False) -> None:
-    """Print the built-in institution watchlist (no network)."""
+def institutions(
+    category: Annotated[
+        Optional[str],
+        Parameter(name="--category", help="Filter by category (e.g. bank, hedge, biotech); omit for all."),
+    ] = None,
+    json: JsonFlag = False,
+) -> None:
+    """Print the built-in institution watchlist, sorted by latest 13F value (no network).
+
+    'Ratings Desk' flags institutions whose affiliates publish sell-side
+    analyst ratings — a conflict-of-interest flag when their 13F positions
+    move against/around their own published ratings.
+    """
+    items = list(WATCHLIST)
+    if category and category != "all":
+        items = [i for i in items if i["category"] == category]
+        if not items:
+            err_console.print(
+                f"[red]Error:[/red] no institutions in category '{category}' "
+                f"(choose from: {', '.join(categories())})"
+            )
+            raise SystemExit(2)
+    items.sort(key=lambda i: -(i.get("value_b") or 0))
     if json:
-        print_json(WATCHLIST)
+        print_json(items)
         return
     render_table(
-        "Watchlist",
-        ["Name", "CIK", "Category"],
-        ([i["name"], i["cik"], i["category"]] for i in WATCHLIST),
+        f"Watchlist ({len(items)} institutions, by latest 13F value)",
+        ["Name", "CIK", "Category", "13F Value ($B)", "Ratings Desk"],
+        (
+            [
+                i["name"],
+                i["cik"],
+                i["category"],
+                f"{i['value_b']:,.1f}" if i.get("value_b") else "-",
+                "[yellow]YES[/yellow]" if i.get("ratings") else "",
+            ]
+            for i in items
+        ),
     )
 
 
@@ -125,27 +160,47 @@ def search(query: str, json: JsonFlag = False, no_cache: NoCacheFlag = False) ->
     _run(_go)
 
 
-@app.command
-def holdings(
-    external_id: str,
+def _filing_row_dict(r: list) -> dict[str, Any]:
+    """Named-field dict for a raw 13f.info holdings row (agent-friendly JSON)."""
+    return {
+        "symbol": r[0],
+        "issuer": r[1],
+        "class": r[2],
+        "cusip": r[3],
+        "value_thousands": r[4],
+        "pct_portfolio": r[5],
+        "shares": r[6],
+        "put_call": r[8] if len(r) > 8 else None,
+    }
+
+
+@app.command(name="filing", alias=["holdings"])
+def filing(
+    external_id: Annotated[
+        str,
+        Parameter(help="SEC accession number of the filing, dashes optional (find via `13f filings <cik>`)."),
+    ],
     limit: LimitOpt = None,
     json: JsonFlag = False,
     no_cache: NoCacheFlag = False,
 ) -> None:
-    """Aggregated holdings for a 13F filing (external_id = accession number, dashes optional)."""
+    """Positions reported in ONE 13F filing (alias: holdings).
+
+    --json prints ALL rows with named fields; --limit only affects the table.
+    """
 
     def _go() -> None:
         eid = _external_id(external_id)
         data = get_json(f"{THIRTEENF_BASE}/data/13f/{eid}", no_cache=no_cache)
-        if json:
-            print_json(data)
-            return
-        # rows: [symbol, issuer_name, class_title, cusip, value_thousands, pct, shares, ...]
+        # rows: [symbol, issuer_name, class_title, cusip, value_thousands, pct, shares, ?, put_call]
         rows = sorted(data.get("data", []), key=lambda r: (r[4] is None, -(r[4] or 0)))
+        if json:
+            print_json([_filing_row_dict(r) for r in rows])
+            return
         if limit:
             rows = rows[:limit]
         render_table(
-            f"Holdings — {eid}",
+            f"Filing {eid} — holdings",
             ["Symbol", "Issuer", "Class", "CUSIP", "Value ($000)", "% Port", "Shares"],
             (
                 [r[0] or "-", trunc(r[1], 24), trunc(r[2], 14), r[3], fmt_usd_thousands(r[4]), fmt_pct(r[5]), fmt_int(r[6])]
@@ -246,10 +301,30 @@ def _compare_row(r: list, detailed: bool) -> list[str]:
     return cells
 
 
+def _compare_row_dict(r: list) -> dict[str, Any]:
+    """Named-field dict for a raw 13f.info compare row (agent-friendly JSON)."""
+    return {
+        "symbol": r[0],
+        "issuer": r[1],
+        "class": r[2],
+        "cusip": r[3],
+        "put_call": r[4],
+        "shares_before": r[5],
+        "shares_after": r[6],
+        "shares_delta": r[7],
+        "shares_delta_pct": r[8],
+        "value_before_thousands": r[9],
+        "value_after_thousands": r[10],
+        "value_delta_thousands": r[11],
+        "value_delta_pct": r[12],
+        "status": _classify(r),
+    }
+
+
 @app.command
 def compare(
-    external_id: str,
-    other_external_id: str,
+    new_id: Annotated[str, Parameter(help="external_id of the NEWER filing (accession number, dashes optional).")],
+    old_id: Annotated[str, Parameter(help="external_id of the OLDER filing to compare against.")],
     only: OnlyOpt = None,
     limit: LimitOpt = None,
     all: Annotated[bool, Parameter(name="--all", help="Include unchanged positions.")] = False,
@@ -257,17 +332,17 @@ def compare(
     json: JsonFlag = False,
     no_cache: NoCacheFlag = False,
 ) -> None:
-    """Compare two 13F filings: summary panel + split increased/decreased tables."""
+    """Compare two 13F filings of one manager: summary panel + split increased/decreased tables."""
 
     kinds = _validate_only(only) if only else None
 
     def _go() -> None:
-        eid, other = _external_id(external_id), _external_id(other_external_id)
+        eid, other = _external_id(new_id), _external_id(old_id)
         rows = _compare_rows(eid, other, no_cache=no_cache)
         if json:
             if kinds:
                 rows = [r for r in rows if _classify(r) in kinds]
-            print_json({"data": rows})
+            print_json([_compare_row_dict(r) for r in rows])
             return
 
         counts = Counter(_classify(r) for r in rows)
@@ -355,12 +430,26 @@ def compare(
 # --- holders -------------------------------------------------------------
 
 
+def _holder_row_dict(r: list) -> dict[str, Any]:
+    """Named-field dict for a raw 13f.info holders row (agent-friendly JSON)."""
+    return {
+        "manager": r[0][0],
+        "cik": str(r[0][1]).zfill(10),
+        "cusip": r[0][2],
+        "period_end": r[1][0],
+        "filing": r[1][1],
+        "value_thousands": r[2],
+        "shares": r[3],
+        "put_call": r[4] if len(r) > 4 else None,
+    }
+
+
 @app.command
 def holders(
     cusip: Annotated[str, Parameter(help="9-char CUSIP, e.g. 172573107 for CRCL.")],
     year: Annotated[int, Parameter(help="Report year, e.g. 2026.")],
     quarter: Annotated[int, Parameter(help="Report quarter, 1-4.")],
-    limit: Annotated[int, Parameter(help="Max managers to list.")] = 25,
+    limit: LimitOpt = None,
     symbol: Annotated[
         Optional[str],
         Parameter(name="--symbol", help="Ticker for % of shares outstanding (auto-resolved when omitted)."),
@@ -368,19 +457,22 @@ def holders(
     json: JsonFlag = False,
     no_cache: NoCacheFlag = False,
 ) -> None:
-    """All managers holding a CUSIP in a given quarter (sorted by value desc)."""
+    """All managers holding a CUSIP in a given quarter (sorted by value desc).
+
+    --json prints ALL rows with named fields; --limit only affects the table.
+    """
 
     def _go() -> None:
         data = get_json(f"{THIRTEENF_BASE}/data/cusip/{cusip}/{year}/{quarter}", no_cache=no_cache)
-        if json:
-            print_json(data)
-            return
-        # rows: [[manager_name, cik, cusip], [period_end, filing_slug], value_thousands, shares, ...]
+        # rows: [[manager_name, cik, cusip], [period_end, filing_slug], value_thousands, shares, put_call]
         rows = sorted(data.get("data", []), key=lambda r: (r[2] is None, -(r[2] or 0)))
+        if json:
+            print_json([_holder_row_dict(r) for r in rows])
+            return
         if limit:
             rows = rows[:limit]
         render_table(
-            f"Holders of {cusip} — {year} Q{quarter}",
+            f"Holders of {cusip} — {year} Q{quarter} ({len(rows)} shown)",
             ["Manager", "CIK", "Period End", "Value ($000)", "Shares", "Filing"],
             (
                 [trunc(r[0][0], 28), r[0][1], r[1][0], fmt_usd_thousands(r[2]), fmt_int(r[3]), trunc(r[1][1], 22)]
@@ -416,7 +508,13 @@ def holders(
 # --- position (per-ticker consensus) -------------------------------------
 
 _WATCHLIST_BY_CIK = {i["cik"].zfill(10): i for i in WATCHLIST}
-_WL_BADGE = {"biotech": "BIO", "megafund": "MEGA"}
+_RATINGS_BY_CIK = {i["cik"].zfill(10): bool(i.get("ratings")) for i in WATCHLIST}
+
+
+def _badge(inst: dict[str, Any]) -> str:
+    """Watchlist badge: short category code, '·R' suffix for sell-side ratings desks."""
+    badge = inst["category"].upper()[:6]
+    return f"{badge}·R" if inst.get("ratings") else badge
 
 
 def _prev_quarter(year: int, quarter: int) -> tuple[int, int]:
@@ -520,7 +618,8 @@ def position(
                 {
                     "manager": name,
                     "cik": cik,
-                    "watchlist": _WL_BADGE.get(inst["category"], "") if inst else "",
+                    "watchlist": _badge(inst) if inst else "",
+                    "rates_stocks": bool(inst and inst.get("ratings")),
                     "status": status,
                     "shares_now": shares_now,
                     "shares_prev": shares_prev,
@@ -540,6 +639,7 @@ def position(
         wl_value_delta = sum(d["value_delta"] for d in wl)
         wl_shares_now = sum(d["shares_now"] for d in wl)
         wl_shares_prev = sum(d["shares_prev"] for d in wl)
+        wl_rated_now = sum(1 for d in wl_now if d["rates_stocks"])
         # totals across ALL listed managers (not just the watchlist)
         all_shares_now = sum(d["shares_now"] for d in records)
         all_shares_prev = sum(d["shares_prev"] for d in records)
@@ -584,6 +684,7 @@ def position(
                         "net_value_delta": wl_value_delta,
                         "pct_out_now": wl_pct_now,
                         "pct_out_prev": wl_pct_prev,
+                        "ratings_desks_now": wl_rated_now,
                     },
                     "all": {
                         "holders_now": len(cur),
@@ -615,7 +716,8 @@ def position(
             f"[red]REDUCED {counts.get('REDUCED', 0)}[/red] · "
             f"[red]CLOSED {counts.get('CLOSED', 0)}[/red] · "
             f"UNCHANGED {counts.get('UNCHANGED', 0)}",
-            f"Watchlist: {len(wl_now)} holders now (prev {len(wl_prev)}) · "
+            f"Watchlist: {len(wl_now)} holders now (prev {len(wl_prev)}; "
+            f"{wl_rated_now} with ratings desks) · "
             f"net shares Δ [{'green' if wl_shares_delta >= 0 else 'red'}]{wl_shares_delta:+,}[/] · "
             f"net value Δ [{'green' if wl_value_delta >= 0 else 'red'}]${wl_value_delta:+,}[/] ($000)",
             f"All listed: {len(records)} managers · "
@@ -695,24 +797,42 @@ def position(
     _run(_go)
 
 
+def _history_row_dict(r: list) -> dict[str, Any]:
+    """Named-field dict for a raw 13f.info history row (agent-friendly JSON)."""
+    return {
+        "period_end": r[0][0],
+        "filing": r[0][1],
+        "value_thousands": r[1],
+        "pct_portfolio": r[2],
+        "shares": r[3],
+        "put_call": r[4],
+        "filing_date": r[5],
+        "year": r[6][0] if r[6] else None,
+        "quarter": r[6][1] if r[6] else None,
+    }
+
+
 @app.command
 def history(
-    cik: str,
-    cusip: str,
+    cik: Annotated[str, Parameter(help="Manager CIK (digits; zero-padding handled).")],
+    cusip: Annotated[str, Parameter(help="9-char CUSIP, e.g. 172573107 for CRCL.")],
     limit: LimitOpt = None,
     json: JsonFlag = False,
     no_cache: NoCacheFlag = False,
 ) -> None:
-    """One manager's position history in one stock."""
+    """One manager's position history in one stock.
+
+    --json prints ALL rows with named fields; --limit only affects the table.
+    """
 
     def _go() -> None:
         data = get_json(f"{THIRTEENF_BASE}/data/manager/{cik}/cusip/{cusip}", no_cache=no_cache)
-        if json:
-            print_json(data)
-            return
         # rows: [[period_end, filing_slug], value_thousands, pct, shares, put_call,
         #        filing_date, [year, quarter]]
         rows = data.get("data", [])
+        if json:
+            print_json([_history_row_dict(r) for r in rows])
+            return
         if limit:
             rows = rows[:limit]
         render_table(
@@ -733,7 +853,7 @@ def filings(
     json: JsonFlag = False,
     no_cache: NoCacheFlag = False,
 ) -> None:
-    """Recent 13F filings for a CIK from SEC EDGAR (external_id pipes into holdings/compare)."""
+    """Recent 13F filings for a CIK from SEC EDGAR (external_id pipes into filing/compare)."""
 
     def _go() -> None:
         records = _edgar_13f_filings(cik, no_cache=no_cache)
@@ -845,25 +965,31 @@ def _latest_two_periods(cik: str, *, no_cache: bool = False) -> Optional[tuple[s
 
 @app.command
 def consensus(
-    category: Annotated[str, Parameter(name="--category", help="Watchlist category: biotech | megafund | all.")] = "all",
+    category: Annotated[str, Parameter(name="--category", help="Watchlist category (see `13f institutions`) or 'all'.")] = "all",
     ciks: Annotated[Optional[str], Parameter(name="--ciks", help='Comma-separated CIKs, e.g. "0001,0002" (overrides watchlist).')] = None,
     min_funds: Annotated[int, Parameter(name="--min-funds", help="Min distinct funds reporting a CUSIP.")] = 2,
-    enrich: Annotated[int, Parameter(name="--enrich", help="Enrich top N rows (symbol + yfinance %% outstanding). 0 disables.")] = 15,
+    enrich: Annotated[int, Parameter(name="--enrich", help="Enrich top N rows (symbol + yfinance % outstanding). 0 disables.")] = 15,
     limit: LimitOpt = None,
     json: JsonFlag = False,
     no_cache: NoCacheFlag = False,
 ) -> None:
-    """Aggregate quarter-over-quarter 13F moves across the watchlist by CUSIP."""
+    """Aggregate quarter-over-quarter 13F moves across the watchlist by CUSIP.
+
+    The 'R' column counts currently-holding funds that run sell-side ratings
+    desks — a conflict-of-interest flag (ratings vs. positioning).
+    """
 
     def _go() -> None:
         cat = category.lower()
-        if cat not in ("biotech", "megafund", "all"):
-            err_console.print(f"[red]Error:[/red] --category must be biotech|megafund|all, got '{category}'")
+        if cat != "all" and cat not in categories():
+            err_console.print(
+                f"[red]Error:[/red] --category must be one of: all, {', '.join(categories())} — got '{category}'"
+            )
             raise SystemExit(2)
         label = cat
         if ciks:
             institutions = [
-                {"name": c.strip(), "cik": c.strip().zfill(10), "category": "custom"}
+                {"name": c.strip(), "cik": c.strip().zfill(10), "category": "custom", "ratings": False}
                 for c in ciks.split(",")
                 if c.strip()
             ]
@@ -913,6 +1039,9 @@ def consensus(
             err_console.print("[red]Error:[/red] no compare data for any CIK in the set")
             raise SystemExit(1)
 
+        # ratings-desk lookup covers custom CIKs too when they are watchlist members
+        ratings_of = {inst["cik"]: _RATINGS_BY_CIK.get(inst["cik"], bool(inst.get("ratings"))) for inst in institutions}
+
         # d: aggregate by CUSIP across funds
         agg: dict[str, dict[str, Any]] = {}
         for cik, rows in per_fund.items():
@@ -931,6 +1060,7 @@ def consensus(
                         "red": set(),
                         "closed": set(),
                         "holding_now": set(),
+                        "ratings_holding": set(),
                         "value_now": 0,
                         "value_delta": 0,
                         "shares_now": 0,
@@ -952,6 +1082,8 @@ def consensus(
                     e["closed"].add(cik)
                 if (r[10] or 0) > 0:
                     e["holding_now"].add(cik)
+                    if ratings_of.get(cik):
+                        e["ratings_holding"].add(cik)
                     e["value_now"] += r[10] or 0
                     e["shares_now"] += r[6] or 0
                 e["value_delta"] += r[11] or 0
@@ -972,6 +1104,7 @@ def consensus(
                     "funds_reduced": len(e["red"]),
                     "funds_closed": len(e["closed"]),
                     "n_funds_holding_now": len(e["holding_now"]),
+                    "n_ratings_funds_holding": len(e["ratings_holding"]),
                     "sum_value_now": e["value_now"],
                     "sum_value_delta": e["value_delta"],
                     "sum_shares_now": e["shares_now"],
@@ -1019,7 +1152,7 @@ def consensus(
         )
         render_table(
             f"Consensus — {label} ({len(shown)} of {len(results)} rows)",
-            ["Symbol", "Issuer", "CUSIP", "Funds", "NEW", "INC", "RED", "CLS", "Net", "Hold", "Val Now ($000)", "Val Δ ($000)", "% Out"],
+            ["Symbol", "Issuer", "CUSIP", "Funds", "NEW", "INC", "RED", "CLS", "Net", "Hold", "R", "Val Now ($000)", "Val Δ ($000)", "% Out"],
             (
                 [
                     (d["symbol"] or "-"),
@@ -1032,6 +1165,7 @@ def consensus(
                     f"[red]{d['funds_closed']}[/red]" if d["funds_closed"] else "0",
                     f"[{'green' if d['net_funds'] >= 0 else 'red'}]{d['net_funds']:+d}[/]",
                     str(d["n_funds_holding_now"]),
+                    f"[yellow]{d['n_ratings_funds_holding']}[/yellow]" if d["n_ratings_funds_holding"] else "0",
                     fmt_usd_thousands(d["sum_value_now"]),
                     f"[{'green' if d['sum_value_delta'] >= 0 else 'red'}]{fmt_usd_thousands(d['sum_value_delta'])}[/]",
                     f"{d['watchlist_pct_outstanding']:.2f}%" if d["watchlist_pct_outstanding"] is not None else "-",
