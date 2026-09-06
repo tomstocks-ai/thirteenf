@@ -61,7 +61,7 @@ with progress on stderr.
 | `13f holdings` | `<external_id>` | Aggregated holdings of one filing |
 | `13f compare` | `<new_id> <old_id>` | QoQ position changes: summary panel + split INCREASED/NEW vs DECREASED/CLOSED tables (`--all` includes unchanged, `--detailed` adds Class/Put-Call) |
 | `13f holders` | `<cusip> <year> <quarter> [limit]` | All managers holding a CUSIP that quarter, with totals footer (`--symbol` for % of shares outstanding) |
-| `13f position` | `<cusip> <year> <quarter> [--symbol T] [--limit N]` | QoQ holder consensus for one ticker: holders regrouped into INCREASED/NEW, REDUCED/CLOSED, UNCHANGED tables (`--limit` per group), watchlist badges, and totals + % of shares outstanding for both the watchlist and ALL listed managers |
+| `13f position` | `<cusip> <year> <quarter> [--symbol T] [--limit N] [--all]` | QoQ holder consensus for one ticker: holders regrouped into INCREASED/NEW and REDUCED/CLOSED tables (`--limit` per group, `--all` adds UNCHANGED), watchlist badges, and totals + % of shares outstanding for both the watchlist and ALL listed managers |
 | `13f history` | `<cik> <cusip>` | One manager's position in one stock over time |
 | `13f consensus` | `[--category biotech\|megafund\|all] [--ciks "0001,0002"] [--min-funds 2] [--enrich 15] [--limit N]` | Cross-fund aggregation of the latest QoQ moves |
 | `13f ticker` | `<symbol>` | Quote & profile via yfinance (name, sector, market cap, shares outstanding, float, price, 52w range, avg volume) |

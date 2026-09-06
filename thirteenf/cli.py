@@ -465,15 +465,16 @@ def position(
         Optional[str],
         Parameter(name="--symbol", help="Ticker symbol (auto-resolved via 13f.info autocomplete when omitted)."),
     ] = None,
-    limit: Annotated[int, Parameter(name="--limit", help="Max managers to list.")] = 25,
+    limit: Annotated[int, Parameter(name="--limit", help="Max managers to list per group.")] = 25,
+    all: Annotated[bool, Parameter(name="--all", help="Include unchanged holders.")] = False,
     json: JsonFlag = False,
     no_cache: NoCacheFlag = False,
 ) -> None:
     """Quarter-over-quarter holder consensus for ONE ticker (CUSIP).
 
-    Renders holders regrouped into INCREASED/NEW, REDUCED/CLOSED and UNCHANGED
-    tables (--limit applies per group) and totals shares / % of outstanding
-    across ALL listed managers, not just the watchlist.
+    Renders holders regrouped into INCREASED/NEW and REDUCED/CLOSED tables
+    (--limit applies per group, --all adds UNCHANGED) and totals shares /
+    % of outstanding across ALL listed managers, not just the watchlist.
     """
 
     def _go() -> None:
@@ -665,12 +666,13 @@ def position(
                 f"{d['pct_out']:.2f}%" if d["pct_out"] is not None else "-",
             ]
 
-        # regroup by status: buyers together, sellers together, unchanged last
+        # regroup by status: buyers together, sellers together (unchanged opt-in)
         groups = [
             ("INCREASED / NEW", ("NEW", "INCREASED")),
             ("REDUCED / CLOSED", ("REDUCED", "CLOSED")),
-            ("UNCHANGED", ("UNCHANGED",)),
         ]
+        if all:
+            groups.append(("UNCHANGED", ("UNCHANGED",)))
         for title, statuses in groups:
             subset = [d for d in records if d["status"] in statuses]
             if not subset:
