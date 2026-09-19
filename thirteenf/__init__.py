@@ -1,3 +1,3 @@
 """thirteenf: 13F holdings data from 13f.info and SEC EDGAR."""
 
-__version__ = "0.2.0"
+__version__ = "0.4.0"
