@@ -205,3 +205,16 @@ WATCHLIST: list[Institution] = [
     {"name": "Boxer Capital", "cik": "0001465837", "category": "biotech", "value_b": 1.5, "ratings": False},
     {"name": "Redmile Group", "cik": "0001425738", "category": "biotech", "value_b": 1.49, "ratings": False},
 ]
+
+# Sub-filer CIKs that roll up to a watchlist parent (alias CIK -> parent CIK).
+# Used for badge/rating lookups in `position`/`consensus`; filings and
+# consensus fetching still use the parent CIK.
+WATCHLIST_ALIASES: dict[str, str] = {
+    # Vanguard sub-advisers (Vanguard splits its 13F across entities since 2025)
+    "0002100119": "0000102909",  # Vanguard Capital Management LLC (~$4.7T)
+    "0002100121": "0000102909",  # Vanguard Portfolio Management LLC (~$2.2T)
+    "0000933478": "0000102909",  # Vanguard Fiduciary Trust Co (~$454B)
+    "0001811242": "0000102909",  # Vanguard Global Advisers LLC (~$215B)
+    "0001680208": "0000102909",  # Vanguard Asset Management, Ltd (~$148B)
+    "0000947529": "0000102909",  # Vanguard Advisers Inc (~$29B)
+}

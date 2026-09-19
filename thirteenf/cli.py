@@ -16,8 +16,15 @@ from rich.progress import (
     TimeElapsedColumn,
 )
 
+from thirteenf.changes import Change
 from thirteenf.client import EDGAR_BASE, THIRTEENF_BASE, FetchError, get_json
-from thirteenf.quotes import get_quote
+from thirteenf.hub import hub_cusips
+from thirteenf.quotes import (
+    get_institutional_breakdown,
+    get_quote,
+    get_shares_history,
+    shares_asof,
+)
 from thirteenf.render import (
     console,
     err_console,
@@ -29,7 +36,7 @@ from thirteenf.render import (
     render_table,
     trunc,
 )
-from thirteenf.watchlist import WATCHLIST
+from thirteenf.watchlist import WATCHLIST, WATCHLIST_ALIASES
 
 app = App(name="13f", help="13F holdings data from 13f.info and SEC EDGAR.")
 
@@ -213,34 +220,16 @@ def filing(
 
 # --- compare -------------------------------------------------------------
 
-# compare rows (13 fields):
-# [symbol, issuer, class_title, cusip, put_call, shares_before, shares_after,
-#  shares_delta, shares_delta_pct, value_before, value_after, value_delta,
-#  value_delta_pct]   (values in $thousands)
+
+def _compare_changes(new_id: str, old_id: str, no_cache: bool = False) -> list[Change]:
+    """Per-position changes between two filings, as Change objects."""
+    data = get_json(f"{THIRTEENF_BASE}/data/13f/{new_id}/compare/{old_id}", no_cache=no_cache)
+    return [Change.from_row(r) for r in data.get("data", [])]
 
 
-def _compare_rows(eid: str, other: str, no_cache: bool = False) -> list[list]:
-    data = get_json(f"{THIRTEENF_BASE}/data/13f/{eid}/compare/{other}", no_cache=no_cache)
-    return data.get("data", [])
-
-
-def _classify(r: list) -> str:
-    """Classify a compare row by its value before/after/delta."""
-    before, after, delta = r[9] or 0, r[10] or 0, r[11] or 0
-    if before == 0 and after > 0:
-        return "new"
-    if after == 0 and before > 0:
-        return "closed"
-    if delta > 0:
-        return "increased"
-    if delta < 0:
-        return "reduced"
-    return "unchanged"
-
-
-def _pct_desc(r: list) -> tuple:
+def _pct_desc(c: Change) -> tuple:
     """Sort by value delta % desc, None last."""
-    return (r[12] is None, -(r[12] or 0))
+    return (c.value_delta_pct is None, -(c.value_delta_pct or 0))
 
 
 ONLY_KINDS = ("new", "increased", "reduced", "closed")
@@ -265,60 +254,38 @@ def _validate_only(only: Optional[list[str]]) -> list[str]:
     return [k for k in ONLY_KINDS if k in set(only)]
 
 
-def _only_row(r: list, total_after: int) -> list[str]:
+def _only_row(c: Change, total_after: int) -> list[str]:
     """Full row for a --only table: Symbol, Issuer, CUSIP, before/after, % port."""
-    after = r[10] or 0
-    pct = (after / total_after * 100) if total_after and after else None
+    pct = (c.value_after / total_after * 100) if total_after and c.value_after else None
     return [
-        trunc(r[0], 6) if r[0] else "-",
-        trunc(r[1], 24),
-        r[3],
-        fmt_usd_thousands(r[9]),
-        fmt_usd_thousands(r[10]),
-        fmt_int(r[5]),
-        fmt_int(r[6]),
+        trunc(c.symbol, 6) if c.symbol else "-",
+        trunc(c.issuer, 24),
+        c.cusip,
+        fmt_usd_thousands(c.value_before),
+        fmt_usd_thousands(c.value_after),
+        fmt_int(c.shares_before),
+        fmt_int(c.shares_after),
         f"{pct:.2f}%" if pct is not None else "-",
     ]
 
 
-def _compare_row(r: list, detailed: bool) -> list[str]:
-    kind = _classify(r)
-    marker = {"new": "[bold green]NEW[/bold green]", "closed": "[bold red]CLOSED[/bold red]"}.get(kind, "")
-    color = "green" if (r[11] or 0) > 0 else "red"
-    cells = [marker, trunc(r[0], 6) if r[0] else "-", trunc(r[1], 24)]
+def _change_row(c: Change, detailed: bool) -> list[str]:
+    marker = {"new": "[bold green]NEW[/bold green]", "closed": "[bold red]CLOSED[/bold red]"}.get(c.status, "")
+    color = "green" if c.shares_delta > 0 else "red"
+    cells = [marker, trunc(c.symbol, 6) if c.symbol else "-", trunc(c.issuer, 24)]
     if detailed:
-        cells.append(trunc(r[2], 12))
-    cells.append(r[3])
+        cells.append(trunc(c.class_title, 12))
+    cells.append(c.cusip)
     if detailed:
-        cells.append(r[4] or "-")
+        cells.append(c.put_call or "-")
     cells += [
-        fmt_usd_thousands(r[9]),
-        fmt_usd_thousands(r[10]),
-        f"[{color}]{fmt_usd_thousands(r[11])}[/{color}]",
-        f"[{color}]{fmt_pct(r[12])}[/{color}]",
-        f"[{color}]{fmt_pct(r[8])}[/{color}]",
+        fmt_usd_thousands(c.value_before),
+        fmt_usd_thousands(c.value_after),
+        f"[{color}]{fmt_usd_thousands(c.value_delta)}[/{color}]",
+        f"[{color}]{fmt_pct(c.value_delta_pct)}[/{color}]",
+        f"[{color}]{fmt_pct(c.shares_delta_pct)}[/{color}]",
     ]
     return cells
-
-
-def _compare_row_dict(r: list) -> dict[str, Any]:
-    """Named-field dict for a raw 13f.info compare row (agent-friendly JSON)."""
-    return {
-        "symbol": r[0],
-        "issuer": r[1],
-        "class": r[2],
-        "cusip": r[3],
-        "put_call": r[4],
-        "shares_before": r[5],
-        "shares_after": r[6],
-        "shares_delta": r[7],
-        "shares_delta_pct": r[8],
-        "value_before_thousands": r[9],
-        "value_after_thousands": r[10],
-        "value_delta_thousands": r[11],
-        "value_delta_pct": r[12],
-        "status": _classify(r),
-    }
 
 
 @app.command
@@ -332,30 +299,32 @@ def compare(
     json: JsonFlag = False,
     no_cache: NoCacheFlag = False,
 ) -> None:
-    """Compare two 13F filings of one manager: summary panel + split increased/decreased tables."""
+    """Compare two 13F filings of one manager: summary panel + split increased/decreased tables.
+
+    Positions are classified by SHARE delta (not value), so price drift is
+    never mislabeled as buying/selling — same semantics as `position`.
+    """
 
     kinds = _validate_only(only) if only else None
 
     def _go() -> None:
         eid, other = _external_id(new_id), _external_id(old_id)
-        rows = _compare_rows(eid, other, no_cache=no_cache)
+        changes = _compare_changes(eid, other, no_cache=no_cache)
         if json:
             if kinds:
-                rows = [r for r in rows if _classify(r) in kinds]
-            print_json([_compare_row_dict(r) for r in rows])
+                changes = [c for c in changes if c.status in kinds]
+            print_json([c.to_dict() for c in changes])
             return
 
-        counts = Counter(_classify(r) for r in rows)
-        total_before = sum(r[9] or 0 for r in rows)
-        total_after = sum(r[10] or 0 for r in rows)
+        counts = Counter(c.status for c in changes)
+        total_before = sum(c.value_before for c in changes)
+        total_after = sum(c.value_after for c in changes)
         total_delta = total_after - total_before
         delta_pct = (total_delta / total_before * 100) if total_before else None
-        top_adds = sorted(
-            (r for r in rows if (r[11] or 0) > 0), key=lambda r: -(r[11] or 0)
-        )[:3]
+        top_adds = sorted((c for c in changes if c.value_delta > 0), key=lambda c: -c.value_delta)[:3]
         adds_text = (
             " · ".join(
-                f"{r[0] or trunc(r[1], 14)} +{fmt_usd_thousands(r[11])}" for r in top_adds
+                f"{c.symbol or trunc(c.issuer, 14)} +{fmt_usd_thousands(c.value_delta)}" for c in top_adds
             )
             or "-"
         )
@@ -385,18 +354,18 @@ def compare(
                 "Shrs Before", "Shrs After", "% Port",
             ]
             for kind in kinds:
-                subset = [r for r in rows if _classify(r) == kind]
+                subset = [c for c in changes if c.status == kind]
                 if kind in ("new", "increased"):
-                    subset.sort(key=lambda r: (r[10] is None, -(r[10] or 0)))
+                    subset.sort(key=lambda c: -c.value_after)
                 else:
-                    subset.sort(key=lambda r: (r[9] is None, -(r[9] or 0)))
+                    subset.sort(key=lambda c: -c.value_before)
                 total = len(subset)
                 if limit:
                     subset = subset[:limit]
                 render_table(
                     f"{ONLY_TITLES[kind]} ({len(subset)} of {total})",
                     only_columns,
-                    (_only_row(r, total_after) for r in subset),
+                    (_only_row(c, total_after) for c in subset),
                 )
             return
 
@@ -415,13 +384,13 @@ def compare(
         if all:
             groups.append(("UNCHANGED", lambda k: k == "unchanged"))
         for title, pred in groups:
-            subset = sorted((r for r in rows if pred(_classify(r))), key=_pct_desc)
+            subset = sorted((c for c in changes if pred(c.status)), key=_pct_desc)
             if limit:
                 subset = subset[:limit]
             render_table(
                 f"{title} ({len(subset)}{' shown' if limit else ''})",
                 columns,
-                (_compare_row(r, detailed) for r in subset),
+                (_change_row(c, detailed) for c in subset),
             )
 
     _run(_go)
@@ -482,9 +451,10 @@ def holders(
         # summary footer
         total_value = sum(r[2] or 0 for r in rows)
         total_shares = sum(r[3] or 0 for r in rows)
+        total_common = sum(r[3] or 0 for r in rows if not (len(r) > 4 and r[4]))
         console.print(
             f"[bold]Totals across {len(rows)} listed managers:[/bold] "
-            f"{fmt_int(total_shares)} shares · {fmt_usd_thousands(total_value)} ($000)"
+            f"{fmt_int(total_shares)} shares ({fmt_int(total_common)} common) · {fmt_usd_thousands(total_value)} ($000)"
         )
         sym = symbol or _resolve_symbol(cusip, no_cache=no_cache)
         if not sym:
@@ -495,7 +465,7 @@ def holders(
         if shares_out:
             console.print(
                 f"[bold]{sym}[/bold] shares outstanding: {fmt_int(shares_out)} → "
-                f"listed managers hold [bold]{total_shares / shares_out * 100:.2f}%[/bold]"
+                f"listed managers hold [bold]{total_common / shares_out * 100:.2f}%[/bold] (common shs)"
             )
         else:
             err_console.print(
@@ -508,7 +478,11 @@ def holders(
 # --- position (per-ticker consensus) -------------------------------------
 
 _WATCHLIST_BY_CIK = {i["cik"].zfill(10): i for i in WATCHLIST}
-_RATINGS_BY_CIK = {i["cik"].zfill(10): bool(i.get("ratings")) for i in WATCHLIST}
+for _alias, _parent in WATCHLIST_ALIASES.items():
+    _p = _WATCHLIST_BY_CIK.get(_parent)
+    if _p is not None:
+        _WATCHLIST_BY_CIK[_alias] = _p  # sub-filer rolls up to parent entry
+_RATINGS_BY_CIK = {cik: bool(i.get("ratings")) for cik, i in _WATCHLIST_BY_CIK.items()}
 
 
 def _badge(inst: dict[str, Any]) -> str:
@@ -539,19 +513,100 @@ def _resolve_cusip_info(cusip: str, *, no_cache: bool = False) -> tuple[Optional
 
 
 def _holders_by_cik(rows: list[list]) -> dict[str, dict[str, Any]]:
-    """Aggregate holders-endpoint rows by manager CIK (sums put/call rows).
+    """Aggregate holders-endpoint rows by manager CIK.
 
-    Row shape: [[manager_name, cik, cusip], [period_end, slug], value, shares, ...]
+    Row shape: [[manager_name, cik, cusip], [period_end, slug], value, shares, put_call]
+    `shares` sums all rows (exposure, incl. option legs); `shares_common`
+    excludes put/call rows — the right numerator for % of shares outstanding.
     """
     by_cik: dict[str, dict[str, Any]] = {}
     for r in rows:
         cik = str(r[0][1]).strip().zfill(10)
         e = by_cik.setdefault(
-            cik, {"name": r[0][0], "cik": cik, "value": 0, "shares": 0}
+            cik, {"name": r[0][0], "cik": cik, "value": 0, "shares": 0, "shares_common": 0}
         )
         e["value"] += r[2] or 0
         e["shares"] += r[3] or 0
+        if not (len(r) > 4 and r[4]):  # not a put/call leg
+            e["shares_common"] += r[3] or 0
     return by_cik
+
+
+# --- 13F aggregate cleaning (shared by `position` and `evolution`) ---------
+
+_PRICE_TOLERANCE = 10.0  # implied-price outlier cutoff, as a multiple of the median
+
+
+def _accession(row: list) -> str:
+    """Accession number from a holders-endpoint row's filing slug."""
+    return str(row[1][1]).split("-", 1)[0]
+
+
+def _latest_filing_rows(rows: list[list]) -> list[list]:
+    """Keep only each filer's latest accession, preserving all of its line items.
+
+    A manager legitimately reports several rows per CUSIP in ONE filing (share
+    classes, option legs, sub-accounts) and those must be summed. But an
+    amendment or restatement arrives under a HIGHER accession number and
+    supersedes the original — summing both double-counts the position.
+    """
+    best: dict[str, str] = {}
+    for r in rows:
+        cik = str(r[0][1]).strip().zfill(10)
+        acc = _accession(r)
+        if cik not in best or acc > best[cik]:
+            best[cik] = acc
+    return [r for r in rows if _accession(r) == best[str(r[0][1]).strip().zfill(10)]]
+
+
+def _implied_price(row: list) -> Optional[float]:
+    """Implied per-share price for a row (13F value is in $thousands)."""
+    value, shares = row[2], row[3]
+    if not value or not shares:
+        return None
+    return value * 1000.0 / shares
+
+
+def _drop_price_outliers(rows: list[list]) -> list[list]:
+    """Drop rows whose implied price is >_PRICE_TOLERANCE x off the cross-filer median.
+
+    Catches filer unit errors — e.g. CalSTRS reported 6,446,426,607 AAPL shares
+    against $22.3B in 2026Q2 (value and shares transposed), an implied $3.46 vs
+    a ~$289 median, single-handedly adding 6.4B phantom shares to the total.
+    """
+    prices = [p for p in (_implied_price(r) for r in rows) if p]
+    if len(prices) < 5:  # too few rows to establish a reference price
+        return rows
+    median = sorted(prices)[len(prices) // 2]
+    lo, hi = median / _PRICE_TOLERANCE, median * _PRICE_TOLERANCE
+    return [r for r in rows if (p := _implied_price(r)) is None or lo <= p <= hi]
+
+
+def _clean_rows(rows: list[list]) -> tuple[list[list], int]:
+    """(cleaned rows, rows dropped) — supersede amendments, then drop unit errors."""
+    if not rows:
+        return [], 0
+    cleaned = _drop_price_outliers(_latest_filing_rows(rows))
+    return cleaned, len(rows) - len(cleaned)
+
+
+def _aggregate_13f(cusip: str, year: int, quarter: int, *, no_cache: bool = False) -> dict[str, Any]:
+    """Cleaned 13F totals for a CUSIP in one quarter. Missing quarter -> zeros."""
+    empty = {"filers": 0, "rows_dropped": 0, "common_shares": 0, "value_thousands": 0}
+    try:
+        data = get_json(f"{THIRTEENF_BASE}/data/cusip/{cusip}/{year}/{quarter}", no_cache=no_cache)
+    except FetchError:
+        return empty
+    rows = data.get("data", []) or []
+    if not rows:
+        return empty
+    cleaned, dropped = _clean_rows(rows)
+    return {
+        "filers": len({str(r[0][1]).strip().zfill(10) for r in cleaned}),
+        "rows_dropped": dropped,
+        "common_shares": sum((r[3] or 0) for r in cleaned if not (len(r) > 4 and r[4])),
+        "value_thousands": sum((r[2] or 0) for r in cleaned),
+    }
 
 
 @app.command
@@ -577,13 +632,14 @@ def position(
 
     def _go() -> None:
         cur_data = get_json(f"{THIRTEENF_BASE}/data/cusip/{cusip}/{year}/{quarter}", no_cache=no_cache)
-        cur_rows = cur_data.get("data", []) or []
+        cur_rows, cur_dropped = _clean_rows(cur_data.get("data", []) or [])
         py, pq = _prev_quarter(year, quarter)
         prev_rows: list[list] = []
+        prev_dropped = 0
         prev_available = True
         try:
             prev_data = get_json(f"{THIRTEENF_BASE}/data/cusip/{cusip}/{py}/{pq}", no_cache=no_cache)
-            prev_rows = prev_data.get("data", []) or []
+            prev_rows, prev_dropped = _clean_rows(prev_data.get("data", []) or [])
         except FetchError:
             prev_available = False
         if not prev_rows:
@@ -627,6 +683,8 @@ def position(
                     "value_now": value_now,
                     "value_prev": value_prev,
                     "value_delta": value_now - value_prev,
+                    "shares_common_now": now["shares_common"] if now else 0,
+                    "shares_common_prev": before["shares_common"] if before else 0,
                 }
             )
         records.sort(key=lambda d: -max(d["value_now"], d["value_prev"]))
@@ -637,8 +695,6 @@ def position(
         wl_prev = [d for d in wl if d["value_prev"] > 0]
         wl_shares_delta = sum(d["shares_delta"] for d in wl)
         wl_value_delta = sum(d["value_delta"] for d in wl)
-        wl_shares_now = sum(d["shares_now"] for d in wl)
-        wl_shares_prev = sum(d["shares_prev"] for d in wl)
         wl_rated_now = sum(1 for d in wl_now if d["rates_stocks"])
         # totals across ALL listed managers (not just the watchlist)
         all_shares_now = sum(d["shares_now"] for d in records)
@@ -655,13 +711,19 @@ def position(
         else:
             _, issuer = _resolve_cusip_info(cusip, no_cache=no_cache)
         quote: dict[str, Any] = get_quote(sym, no_cache=no_cache) if sym else {}
+        breakdown: dict[str, Any] = get_institutional_breakdown(sym, no_cache=no_cache) if sym else {}
         shares_out = quote.get("shares_outstanding")
-        wl_pct_now = (wl_shares_now / shares_out * 100) if shares_out else None
-        wl_pct_prev = (wl_shares_prev / shares_out * 100) if shares_out else None
-        all_pct_now = (all_shares_now / shares_out * 100) if shares_out else None
-        all_pct_prev = (all_shares_prev / shares_out * 100) if shares_out else None
+        # % Out numerators use COMMON shares (option legs excluded)
+        wl_common_now = sum(d["shares_common_now"] for d in wl)
+        wl_common_prev = sum(d["shares_common_prev"] for d in wl)
+        all_common_now = sum(d["shares_common_now"] for d in records)
+        all_common_prev = sum(d["shares_common_prev"] for d in records)
+        wl_pct_now = (wl_common_now / shares_out * 100) if shares_out else None
+        wl_pct_prev = (wl_common_prev / shares_out * 100) if shares_out else None
+        all_pct_now = (all_common_now / shares_out * 100) if shares_out else None
+        all_pct_prev = (all_common_prev / shares_out * 100) if shares_out else None
         for d in records:
-            d["pct_out"] = (d["shares_now"] / shares_out * 100) if shares_out else None
+            d["pct_out"] = (d["shares_common_now"] / shares_out * 100) if shares_out else None
 
         if json:
             print_json(
@@ -672,6 +734,7 @@ def position(
                     "prev_year": py,
                     "prev_quarter": pq,
                     "prev_data": prev_available,
+                    "rows_dropped": {"now": cur_dropped, "prev": prev_dropped},
                     "issuer": issuer,
                     "symbol": sym,
                     "holders_now": len(cur),
@@ -697,6 +760,7 @@ def position(
                         "pct_out_prev": all_pct_prev,
                     },
                     "quote": quote,
+                    "yahoo_holders": breakdown,
                     "rows": records,
                 }
             )
@@ -735,15 +799,28 @@ def position(
         if wl_pct_now is not None and wl_pct_prev is not None:
             delta_pp = wl_pct_now - wl_pct_prev
             lines.append(
-                f"Watchlist % Out: {wl_pct_now:.2f}% now vs {wl_pct_prev:.2f}% prev "
+                f"Watchlist % Out (common shs): {wl_pct_now:.2f}% now vs {wl_pct_prev:.2f}% prev "
                 f"([{'green' if delta_pp >= 0 else 'red'}]{delta_pp:+.2f}pp[/])"
             )
         if all_pct_now is not None and all_pct_prev is not None:
             delta_pp = all_pct_now - all_pct_prev
             lines.append(
-                f"All listed % Out: {all_pct_now:.2f}% now vs {all_pct_prev:.2f}% prev "
+                f"All listed % Out (common shs): {all_pct_now:.2f}% now vs {all_pct_prev:.2f}% prev "
                 f"([{'green' if delta_pp >= 0 else 'red'}]{delta_pp:+.2f}pp[/])"
             )
+        if breakdown.get("pct_institutions") is not None:
+            # Yahoo's own snapshot, for reference against the 13F-derived % Out above.
+            # Different basis (all ownership sources, current date) so it usually reads
+            # higher than the 13F floor; see README "Data caveats".
+            yh = f"Yahoo % Held by Institutions: [bold]{breakdown['pct_institutions'] * 100:.2f}%[/bold]"
+            if breakdown.get("pct_institutions_float") is not None:
+                yh += f" (of float {breakdown['pct_institutions_float'] * 100:.2f}%)"
+            if breakdown.get("institutions_count"):
+                yh += f" · {breakdown['institutions_count']:,} institutions"
+            if breakdown.get("pct_insiders") is not None:
+                yh += f" · insiders {breakdown['pct_insiders'] * 100:.2f}%"
+            yh += " [dim](snapshot, today)[/dim]"
+            lines.append(yh)
         console.print(Panel("\n".join(lines), title="Position consensus", title_align="left"))
 
         _STATUS_MARKUP = {
@@ -847,6 +924,186 @@ def history(
     _run(_go)
 
 
+# --- evolution (institutional ownership over time) -------------------------
+
+
+def _quarters_back(n: int) -> list[tuple[int, int]]:
+    """Last `n` calendar quarters, oldest first, as (year, quarter)."""
+    import datetime as _dt
+
+    today = _dt.date.today()
+    year, quarter = today.year, (today.month - 1) // 3 + 1
+    out: list[tuple[int, int]] = []
+    for _ in range(n):
+        out.append((year, quarter))
+        quarter -= 1
+        if quarter == 0:
+            year, quarter = year - 1, 4
+    return list(reversed(out))
+
+
+def _quarter_end(year: int, quarter: int) -> str:
+    """ISO date of a quarter end (13F report period)."""
+    month = quarter * 3
+    return f"{year}-{month:02d}-{30 if month in (6, 9) else 31}"
+
+
+@app.command
+def evolution(
+    cusip: Annotated[str, Parameter(help="9-char CUSIP, e.g. 172573107 for CRCL.")],
+    quarters: Annotated[
+        int, Parameter(name="--quarters", help="How many recent quarters to walk back.")
+    ] = 8,
+    symbol: Annotated[
+        Optional[str],
+        Parameter(name="--symbol", help="Ticker symbol (auto-resolved via 13f.info when omitted)."),
+    ] = None,
+    json: JsonFlag = False,
+    no_cache: NoCacheFlag = False,
+) -> None:
+    """Institutional ownership of ONE stock over time, rebuilt from 13F filings.
+
+    Yahoo's '% Held by Institutions' is a snapshot with no history, so each
+    quarter is recomputed here: 13F-reported COMMON shares summed across all
+    filers / shares outstanding in force at that quarter end. Amendments
+    supersede originals and filer unit errors are dropped (Drop column).
+
+    13F only covers managers over $100M AUM, so the series is a FLOOR and
+    reads below Yahoo's snapshot (shown for reference). Trust the trend, not
+    the level. One HTTP call per quarter, cached 24h.
+    """
+
+    def _go() -> None:
+        if quarters < 1:
+            err_console.print("[red]Error:[/red] --quarters must be >= 1")
+            raise SystemExit(2)
+
+        periods = _quarters_back(quarters)
+        sym = symbol.strip().upper() if symbol else None
+        issuer = None
+        resolved_sym, issuer = _resolve_cusip_info(cusip, no_cache=no_cache)
+        sym = sym or resolved_sym
+
+        # denominator history: fetch from a bit before the first quarter end so
+        # the oldest period still finds a share count at or before it
+        shares_hist: dict[str, int] = {}
+        if sym:
+            first_end = _quarter_end(*periods[0])
+            start = f"{int(first_end[:4]) - 1}{first_end[4:]}"
+            shares_hist = get_shares_history(sym, start, no_cache=no_cache)
+
+        rows: list[dict[str, Any]] = []
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            console=err_console,
+            transient=True,
+        ) as progress:
+            task = progress.add_task("quarters", total=len(periods))
+            for year, quarter in periods:
+                progress.update(task, description=f"{year} Q{quarter}")
+                agg = _aggregate_13f(cusip, year, quarter, no_cache=no_cache)
+                progress.advance(task)
+                if not agg["filers"] or not agg["common_shares"]:
+                    continue  # quarter not filed yet, or no common-share position
+                end = _quarter_end(year, quarter)
+                shares_out = shares_asof(shares_hist, end) if shares_hist else None
+                rows.append(
+                    {
+                        "period": f"{year}Q{quarter}",
+                        "year": year,
+                        "quarter": quarter,
+                        "period_end": end,
+                        "filers": agg["filers"],
+                        "rows_dropped": agg["rows_dropped"],
+                        "common_shares": agg["common_shares"],
+                        "shares_outstanding": shares_out,
+                        "pct_out": (agg["common_shares"] / shares_out * 100) if shares_out else None,
+                        "value_thousands": agg["value_thousands"],
+                    }
+                )
+
+        if not rows:
+            err_console.print(
+                f"[yellow]No 13F data on 13f.info for {cusip} in the last {quarters} quarters.[/yellow]"
+            )
+            raise SystemExit(1)
+
+        # pp change vs the previous reported quarter
+        prev_pct: Optional[float] = None
+        for r in rows:
+            r["pct_out_delta_pp"] = (
+                None if (prev_pct is None or r["pct_out"] is None) else r["pct_out"] - prev_pct
+            )
+            if r["pct_out"] is not None:
+                prev_pct = r["pct_out"]
+
+        breakdown = get_institutional_breakdown(sym, no_cache=no_cache) if sym else {}
+
+        if json:
+            print_json(
+                {
+                    "cusip": cusip,
+                    "symbol": sym,
+                    "issuer": issuer,
+                    "quarters_requested": quarters,
+                    "yahoo_holders": breakdown,
+                    "history": rows,
+                }
+            )
+            return
+
+        render_table(
+            f"Institutional ownership over time — {issuer or '-'} ({sym or '-'}) — {cusip}",
+            ["Period", "Period End", "Filers", "Drop", "13F Common Shs", "Shares Out", "% Out", "Δ pp", "Value ($000)"],
+            (
+                [
+                    r["period"],
+                    r["period_end"],
+                    fmt_int(r["filers"]),
+                    fmt_int(r["rows_dropped"]),
+                    fmt_int(r["common_shares"]),
+                    fmt_int(r["shares_outstanding"]),
+                    f"{r['pct_out']:.2f}%" if r["pct_out"] is not None else "-",
+                    (
+                        f"[{'green' if r['pct_out_delta_pp'] >= 0 else 'red'}]"
+                        f"{r['pct_out_delta_pp']:+.2f}[/]"
+                        if r["pct_out_delta_pp"] is not None
+                        else ""
+                    ),
+                    fmt_usd_thousands(r["value_thousands"]),
+                ]
+                for r in rows
+            ),
+        )
+
+        first, last = rows[0], rows[-1]
+        if first["pct_out"] is not None and last["pct_out"] is not None and len(rows) > 1:
+            swing = last["pct_out"] - first["pct_out"]
+            console.print(
+                f"[bold]{first['period']} → {last['period']}:[/bold] "
+                f"{first['pct_out']:.2f}% → {last['pct_out']:.2f}% "
+                f"([{'green' if swing >= 0 else 'red'}]{swing:+.2f}pp[/]) · "
+                f"filers {first['filers']:,} → {last['filers']:,}"
+            )
+        if breakdown.get("pct_institutions") is not None:
+            console.print(
+                f"Yahoo % Held by Institutions today: "
+                f"[bold]{breakdown['pct_institutions'] * 100:.2f}%[/bold] "
+                f"[dim](snapshot; 13F series above is a floor — different basis)[/dim]"
+            )
+        if not shares_hist:
+            err_console.print(
+                "[dim]no shares-outstanding history from Yahoo — % Out unavailable "
+                "(pass --symbol, or retry: yfinance rate-limits)[/dim]"
+            )
+
+    _run(_go)
+
+
 @app.command
 def filings(
     cik: str,
@@ -942,8 +1199,8 @@ def ticker(symbol: str, json: JsonFlag = False, no_cache: NoCacheFlag = False) -
 # --- consensus -----------------------------------------------------------
 
 
-def _latest_two_periods(cik: str, *, no_cache: bool = False) -> Optional[tuple[str, str]]:
-    """(new_eid, old_eid) for the 2 most recent report periods of a CIK.
+def _latest_two_periods(cik: str, *, no_cache: bool = False) -> Optional[tuple[str, str, str]]:
+    """(new_eid, old_eid, new_period) for the 2 most recent report periods of a CIK.
 
     Filings are grouped by report period; the latest filing per period wins
     (13F-HR/A amendments supersede the original 13F-HR). Returns None when the
@@ -960,7 +1217,36 @@ def _latest_two_periods(cik: str, *, no_cache: bool = False) -> Optional[tuple[s
     if len(best) < 2:
         return None
     periods = sorted(best, reverse=True)[:2]
-    return best[periods[0]][1].replace("-", ""), best[periods[1]][1].replace("-", "")
+    return (
+        best[periods[0]][1].replace("-", ""),
+        best[periods[1]][1].replace("-", ""),
+        periods[0],
+    )
+
+
+def _period_year_quarter(period: str) -> Optional[tuple[int, int]]:
+    """'2026-06-30' -> (2026, 2). None on unparseable input."""
+    try:
+        year, month, _ = (int(p) for p in period.split("-"))
+        return year, (month - 1) // 3 + 1
+    except (ValueError, AttributeError):
+        return None
+
+
+def _shares_outstanding_split(
+    cusip: str, year: int, quarter: int, *, no_cache: bool = False
+) -> tuple[int, int]:
+    """(watchlist_shares, all_shares) held in a CUSIP for one quarter.
+
+    `shares` sums all rows (exposure, incl. option legs); the returned totals
+    are COMMON shares only (option legs excluded) — the right numerator for
+    % of shares outstanding.
+    """
+    data = get_json(f"{THIRTEENF_BASE}/data/cusip/{cusip}/{year}/{quarter}", no_cache=no_cache)
+    by_cik = _holders_by_cik(data.get("data", []) or [])
+    all_shares = sum(e["shares_common"] for e in by_cik.values())
+    wl_shares = sum(e["shares_common"] for c, e in by_cik.items() if c in _WATCHLIST_BY_CIK)
+    return wl_shares, all_shares
 
 
 @app.command
@@ -969,6 +1255,7 @@ def consensus(
     ciks: Annotated[Optional[str], Parameter(name="--ciks", help='Comma-separated CIKs, e.g. "0001,0002" (overrides watchlist).')] = None,
     min_funds: Annotated[int, Parameter(name="--min-funds", help="Min distinct funds reporting a CUSIP.")] = 2,
     enrich: Annotated[int, Parameter(name="--enrich", help="Enrich top N rows (symbol + yfinance % outstanding). 0 disables.")] = 15,
+    hub: Annotated[bool, Parameter(name="--hub", help="Keep only stocks covered by the Deep Dives Hub (ddq).")] = False,
     limit: LimitOpt = None,
     json: JsonFlag = False,
     no_cache: NoCacheFlag = False,
@@ -976,7 +1263,9 @@ def consensus(
     """Aggregate quarter-over-quarter 13F moves across the watchlist by CUSIP.
 
     The 'R' column counts currently-holding funds that run sell-side ratings
-    desks — a conflict-of-interest flag (ratings vs. positioning).
+    desks — a conflict-of-interest flag (ratings vs. positioning). --hub keeps
+    only Deep-Dives-Hub-covered names (resolve with `ddq dd <TICKER>`).
+    Positions are classified by SHARE delta, same as `position`.
     """
 
     def _go() -> None:
@@ -1008,8 +1297,9 @@ def consensus(
             TimeElapsedColumn(),
             console=err_console,
         ) as progress:
-            # b+c: per CIK, latest 2 periods -> compare rows
-            per_fund: dict[str, list[list]] = {}
+            # b+c: per CIK, latest 2 periods -> Change objects
+            per_fund: dict[str, list[Change]] = {}
+            latest_periods: list[str] = []
             task = progress.add_task("fetching filings", total=len(institutions))
             for inst in institutions:
                 cik = inst["cik"]
@@ -1027,12 +1317,13 @@ def consensus(
                     progress.advance(task)
                     continue
                 try:
-                    rows = _compare_rows(pair[0], pair[1], no_cache=no_cache)
+                    changes = _compare_changes(pair[0], pair[1], no_cache=no_cache)
                 except FetchError as exc:
                     err_console.print(f"[yellow]skip {cik} ({inst['name']}): {exc}[/yellow]")
                     progress.advance(task)
                     continue
-                per_fund[cik] = rows
+                per_fund[cik] = changes
+                latest_periods.append(pair[2])
                 progress.advance(task)
 
         if not per_fund:
@@ -1042,11 +1333,11 @@ def consensus(
         # ratings-desk lookup covers custom CIKs too when they are watchlist members
         ratings_of = {inst["cik"]: _RATINGS_BY_CIK.get(inst["cik"], bool(inst.get("ratings"))) for inst in institutions}
 
-        # d: aggregate by CUSIP across funds
+        # d: aggregate by CUSIP across funds (share-based status, like `position`)
         agg: dict[str, dict[str, Any]] = {}
-        for cik, rows in per_fund.items():
-            for r in rows:
-                cusip = r[3]
+        for cik, changes in per_fund.items():
+            for c in changes:
+                cusip = c.cusip
                 if not cusip:
                     continue
                 e = agg.setdefault(
@@ -1066,27 +1357,26 @@ def consensus(
                         "shares_now": 0,
                     },
                 )
-                if r[1]:
-                    e["issuers"][r[1]] += 1
-                if e["symbol"] is None and r[0]:
-                    e["symbol"] = r[0]
+                if c.issuer:
+                    e["issuers"][c.issuer] += 1
+                if e["symbol"] is None and c.symbol:
+                    e["symbol"] = c.symbol
                 e["funds"].add(cik)
-                kind = _classify(r)
-                if kind == "new":
+                if c.status == "new":
                     e["new"].add(cik)
-                elif kind == "increased":
+                elif c.status == "increased":
                     e["inc"].add(cik)
-                elif kind == "reduced":
+                elif c.status == "reduced":
                     e["red"].add(cik)
-                elif kind == "closed":
+                elif c.status == "closed":
                     e["closed"].add(cik)
-                if (r[10] or 0) > 0:
+                if c.holds_after:
                     e["holding_now"].add(cik)
                     if ratings_of.get(cik):
                         e["ratings_holding"].add(cik)
-                    e["value_now"] += r[10] or 0
-                    e["shares_now"] += r[6] or 0
-                e["value_delta"] += r[11] or 0
+                    e["value_now"] += c.value_after
+                    e["shares_now"] += c.shares_after
+                e["value_delta"] += c.value_delta
 
         # e: filter + sort
         results: list[dict[str, Any]] = []
@@ -1111,10 +1401,38 @@ def consensus(
                     "net_funds": len(e["new"]) + len(e["inc"]) - len(e["red"]) - len(e["closed"]),
                     "sector": None,
                     "market_cap": None,
-                    "watchlist_pct_outstanding": None,
+                    "pct_out_watchlist": None,
+                    "pct_out_all": None,
+                    "pct_out_source": None,
                 }
             )
         results.sort(key=lambda d: (-d["net_funds"], -d["sum_value_delta"]))
+
+        # e2: optional Deep Dives Hub filter — keeps only hub-covered CUSIPs.
+        # Hub membership is checked by CUSIP (the ticker->CUSIP mapping is
+        # precomputed once and cached 7 days), so this is O(1) per row.
+        if hub:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                TimeElapsedColumn(),
+                console=err_console,
+            ) as progress:
+                task = progress.add_task("hub cusips", total=None)
+                covered = hub_cusips(
+                    no_cache=no_cache,
+                    progress=lambda t: progress.update(task, description=f"hub cusips: {t}"),
+                )
+            err_console.print(f"[dim]deep-dives hub covers {len(covered)} CUSIPs[/dim]")
+            for d in results:
+                if d["cusip"] in covered:
+                    d["hub"] = True
+            results = [d for d in results if d.get("hub")]
+
+        # most common latest report period across funds -> quarter for the
+        # per-CUSIP holders endpoint (same data path `position` uses)
+        mode_period = Counter(p for p in latest_periods if p).most_common(1)
+        hq = _period_year_quarter(mode_period[0][0]) if mode_period else None
 
         # f: enrichment (autocomplete symbol recovery + yfinance)
         if enrich:
@@ -1137,8 +1455,18 @@ def consensus(
                         d["sector"] = quote.get("sector")
                         d["market_cap"] = quote.get("market_cap")
                         shares_out = quote.get("shares_outstanding")
-                        if shares_out:
-                            d["watchlist_pct_outstanding"] = d["sum_shares_now"] / shares_out * 100
+                        if shares_out and hq:
+                            try:
+                                wl_sh, all_sh = _shares_outstanding_split(
+                                    d["cusip"], hq[0], hq[1], no_cache=no_cache
+                                )
+                                d["pct_out_watchlist"] = wl_sh / shares_out * 100
+                                d["pct_out_all"] = all_sh / shares_out * 100
+                                d["pct_out_source"] = "holders"
+                            except FetchError:
+                                # fall back to compare-row share sums (watchlist funds only)
+                                d["pct_out_watchlist"] = d["sum_shares_now"] / shares_out * 100
+                                d["pct_out_source"] = "compare"
                     progress.advance(task)
 
         if json:
@@ -1148,11 +1476,13 @@ def consensus(
         shown = results[:limit] if limit else results
         err_console.print(
             f"[dim]{len(per_fund)}/{len(institutions)} funds · {len(agg)} CUSIPs · "
-            f"{len(results)} pass --min-funds {min_funds}[/dim]"
+            f"{len(results)} pass --min-funds {min_funds}"
+            + (f" · holders period {mode_period[0][0]}" if mode_period else "")
+            + "[/dim]"
         )
         render_table(
             f"Consensus — {label} ({len(shown)} of {len(results)} rows)",
-            ["Symbol", "Issuer", "CUSIP", "Funds", "NEW", "INC", "RED", "CLS", "Net", "Hold", "R", "Val Now ($000)", "Val Δ ($000)", "% Out"],
+            ["Symbol", "Issuer", "CUSIP", "Funds", "NEW", "INC", "RED", "CLS", "Net", "Hold", "R", "Val Now ($000)", "Val Δ ($000)", "WL %Out", "All %Out"],
             (
                 [
                     (d["symbol"] or "-"),
@@ -1168,7 +1498,8 @@ def consensus(
                     f"[yellow]{d['n_ratings_funds_holding']}[/yellow]" if d["n_ratings_funds_holding"] else "0",
                     fmt_usd_thousands(d["sum_value_now"]),
                     f"[{'green' if d['sum_value_delta'] >= 0 else 'red'}]{fmt_usd_thousands(d['sum_value_delta'])}[/]",
-                    f"{d['watchlist_pct_outstanding']:.2f}%" if d["watchlist_pct_outstanding"] is not None else "-",
+                    f"{d['pct_out_watchlist']:.2f}%" if d["pct_out_watchlist"] is not None else "-",
+                    f"{d['pct_out_all']:.2f}%" if d["pct_out_all"] is not None else "-",
                 ]
                 for d in shown
             ),
